@@ -7,25 +7,29 @@ import (
 	"fmt"
 	"io"
 	ogLog "log"
+	"os"
 	"os/exec"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/acarl005/stripansi"
-	"github.com/docker/docker/api/types"
+	cliconfig "github.com/docker/cli/cli/config"
+	ddocker "github.com/docker/cli/cli/context/docker"
+	ctxstore "github.com/docker/cli/cli/context/store"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/imdario/mergo"
 	"github.com/jesseduffield/lazydocker/pkg/commands/ssh"
 	"github.com/jesseduffield/lazydocker/pkg/config"
 	"github.com/jesseduffield/lazydocker/pkg/i18n"
 	"github.com/jesseduffield/lazydocker/pkg/utils"
+	"github.com/sasha-s/go-deadlock"
 	"github.com/sirupsen/logrus"
 )
 
 const (
-	APIVersion = "1.25"
+	APIVersion       = "1.25"
+	dockerHostEnvKey = "DOCKER_HOST"
 )
 
 // DockerCommand is our main docker interface
@@ -36,17 +40,11 @@ type DockerCommand struct {
 	Config                 *config.AppConfig
 	Client                 *client.Client
 	InDockerComposeProject bool
-	ShowExited             bool
 	ErrorChan              chan error
-	ContainerMutex         sync.Mutex
-	ServiceMutex           sync.Mutex
-	Services               []*Service
-	Containers             []*Container
-	// DisplayContainers is the array of containers we will display in the containers panel. If Gui.ShowAllContainers is false, this will only be those containers which aren't based on a service. This reduces clutter and duplication in the UI
-	DisplayContainers []*Container
-	Images            []*Image
-	Volumes           []*Volume
-	Closers           []io.Closer
+	ContainerMutex         deadlock.Mutex
+	ServiceMutex           deadlock.Mutex
+
+	Closers []io.Closer
 }
 
 var _ io.Closer = &DockerCommand{}
@@ -63,23 +61,43 @@ type CommandObject struct {
 	Container     *Container
 	Image         *Image
 	Volume        *Volume
+	Network       *Network
 }
 
 // NewCommandObject takes a command object and returns a default command object with the passed command object merged in
 func (c *DockerCommand) NewCommandObject(obj CommandObject) CommandObject {
 	defaultObj := CommandObject{DockerCompose: c.Config.UserConfig.CommandTemplates.DockerCompose}
-	mergo.Merge(&defaultObj, obj)
+	_ = mergo.Merge(&defaultObj, obj)
 	return defaultObj
 }
 
 // NewDockerCommand it runs docker commands
 func NewDockerCommand(log *logrus.Entry, osCommand *OSCommand, tr *i18n.TranslationSet, config *config.AppConfig, errorChan chan error) (*DockerCommand, error) {
-	tunnelCloser, err := ssh.NewSSHHandler().HandleSSHDockerHost()
+	dockerHost, err := determineDockerHost()
+	if err != nil {
+		ogLog.Printf("> could not determine host %v", err)
+	}
+
+	// NOTE: Inject the determined docker host to the environment. This allows the
+	//       `SSHHandler.HandleSSHDockerHost()` to create a local unix socket tunneled
+	//       over SSH to the specified ssh host.
+	if strings.HasPrefix(dockerHost, "ssh://") {
+		os.Setenv(dockerHostEnvKey, dockerHost)
+	}
+
+	tunnelCloser, err := ssh.NewSSHHandler(osCommand).HandleSSHDockerHost()
 	if err != nil {
 		ogLog.Fatal(err)
 	}
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithVersion(APIVersion))
+	// Retrieve the docker host from the environment which could have been set by
+	// the `SSHHandler.HandleSSHDockerHost()` and override `dockerHost`.
+	dockerHostFromEnv := os.Getenv(dockerHostEnvKey)
+	if dockerHostFromEnv != "" {
+		dockerHost = dockerHostFromEnv
+	}
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithVersion(APIVersion), client.WithHost(dockerHost))
 	if err != nil {
 		ogLog.Fatal(err)
 	}
@@ -91,17 +109,11 @@ func NewDockerCommand(log *logrus.Entry, osCommand *OSCommand, tr *i18n.Translat
 		Config:                 config,
 		Client:                 cli,
 		ErrorChan:              errorChan,
-		ShowExited:             true,
 		InDockerComposeProject: true,
 		Closers:                []io.Closer{tunnelCloser},
 	}
 
-	command := utils.ApplyTemplate(
-		config.UserConfig.CommandTemplates.CheckDockerComposeConfig,
-		dockerCommand.NewCommandObject(CommandObject{}),
-	)
-
-	log.Warn(command)
+	dockerCommand.setDockerComposeCommand(config)
 
 	err = osCommand.RunCommand(
 		utils.ApplyTemplate(
@@ -117,72 +129,30 @@ func NewDockerCommand(log *logrus.Entry, osCommand *OSCommand, tr *i18n.Translat
 	return dockerCommand, nil
 }
 
+func (c *DockerCommand) setDockerComposeCommand(config *config.AppConfig) {
+	if config.UserConfig.CommandTemplates.DockerCompose != "docker compose" {
+		return
+	}
+
+	// it's possible that a user is still using docker-compose, so we'll check if 'docker comopose' is available, and if not, we'll fall back to 'docker-compose'
+	err := c.OSCommand.RunCommand("docker compose version")
+	if err != nil {
+		config.UserConfig.CommandTemplates.DockerCompose = "docker-compose"
+	}
+}
+
 func (c *DockerCommand) Close() error {
 	return utils.CloseMany(c.Closers)
 }
 
-// MonitorContainerStats is a function
-func (c *DockerCommand) MonitorContainerStats() {
-	// TODO: pass in a stop channel to these so we don't restart every time we come back from a subprocess
-	go c.MonitorCLIContainerStats()
-	go c.MonitorClientContainerStats()
-}
-
-// MonitorCLIContainerStats monitors a stream of container stats and updates the containers as each new stats object is received
-func (c *DockerCommand) MonitorCLIContainerStats() {
-	command := `docker stats --all --no-trunc --format '{{json .}}'`
-	cmd := c.OSCommand.RunCustomCommand(command)
-
-	r, err := cmd.StdoutPipe()
-	if err != nil {
-		c.ErrorChan <- err
-		return
-	}
-
-	cmd.Start()
-
-	scanner := bufio.NewScanner(r)
-	scanner.Split(bufio.ScanLines)
-	for scanner.Scan() {
-		var stats ContainerCliStat
-		// need to strip ANSI codes because uses escape sequences to clear the screen with each refresh
-		cleanString := stripansi.Strip(scanner.Text())
-		if err := json.Unmarshal([]byte(cleanString), &stats); err != nil {
-			c.ErrorChan <- err
-			return
-		}
-		c.ContainerMutex.Lock()
-		for _, container := range c.Containers {
-			if container.ID == stats.ID {
-				container.CLIStats = stats
-			}
-		}
-		c.ContainerMutex.Unlock()
-	}
-
-	cmd.Wait()
-}
-
-// MonitorClientContainerStats is a function
-func (c *DockerCommand) MonitorClientContainerStats() {
-	// periodically loop through running containers and see if we need to create a monitor goroutine for any
-	// every second we check if we need to spawn a new goroutine
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		for _, container := range c.Containers {
-			if !container.MonitoringStats {
-				go c.createClientStatMonitor(container)
-			}
-		}
-	}
-}
-
-func (c *DockerCommand) createClientStatMonitor(container *Container) {
+func (c *DockerCommand) CreateClientStatMonitor(container *Container) {
 	container.MonitoringStats = true
 	stream, err := c.Client.ContainerStats(context.Background(), container.ID, true)
 	if err != nil {
-		c.ErrorChan <- err
+		// not creating error panel because if we've disconnected from docker we'll
+		// have already created an error panel
+		c.Log.Error(err)
+		container.MonitoringStats = false
 		return
 	}
 
@@ -192,9 +162,9 @@ func (c *DockerCommand) createClientStatMonitor(container *Container) {
 	for scanner.Scan() {
 		data := scanner.Bytes()
 		var stats ContainerStats
-		json.Unmarshal(data, &stats)
+		_ = json.Unmarshal(data, &stats)
 
-		recordedStats := RecordedStats{
+		recordedStats := &RecordedStats{
 			ClientStats: stats,
 			DerivedStats: DerivedStats{
 				CPUPercentage:    stats.CalculateContainerCPUPercentage(),
@@ -203,25 +173,19 @@ func (c *DockerCommand) createClientStatMonitor(container *Container) {
 			RecordedAt: time.Now(),
 		}
 
-		c.ContainerMutex.Lock()
-		container.StatHistory = append(container.StatHistory, recordedStats)
-		container.EraseOldHistory()
-		c.ContainerMutex.Unlock()
+		container.appendStats(recordedStats, c.Config.UserConfig.Stats.MaxDuration)
 	}
 
 	container.MonitoringStats = false
 }
 
-// RefreshContainersAndServices returns a slice of docker containers
-func (c *DockerCommand) RefreshContainersAndServices() error {
+func (c *DockerCommand) RefreshContainersAndServices(currentServices []*Service, currentContainers []*Container) ([]*Container, []*Service, error) {
 	c.ServiceMutex.Lock()
 	defer c.ServiceMutex.Unlock()
 
-	currentServices := c.Services
-
-	containers, err := c.GetContainers()
+	containers, err := c.GetContainers(currentContainers)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	var services []*Service
@@ -231,44 +195,21 @@ func (c *DockerCommand) RefreshContainersAndServices() error {
 	} else {
 		services, err = c.GetServices()
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 	}
 
 	c.assignContainersToServices(containers, services)
 
-	var displayContainers = containers
-	if !c.Config.UserConfig.Gui.ShowAllContainers {
-		displayContainers = c.obtainStandaloneContainers(containers, services)
-	}
-
-	// sort services first by whether they have a linked container, and second by alphabetical order
-	sort.Slice(services, func(i, j int) bool {
-		if services[i].Container != nil && services[j].Container == nil {
-			return true
-		}
-
-		if services[i].Container == nil && services[j].Container != nil {
-			return false
-		}
-
-		return services[i].Name < services[j].Name
-	})
-
-	c.Containers = containers
-	c.Services = services
-	c.DisplayContainers = c.filterOutExited(displayContainers)
-	c.DisplayContainers = c.sortedContainers(c.DisplayContainers)
-
-	return nil
+	return containers, services, nil
 }
 
 func (c *DockerCommand) assignContainersToServices(containers []*Container, services []*Service) {
 L:
 	for _, service := range services {
-		for _, container := range containers {
-			if !container.OneOff && container.ServiceName == service.Name {
-				service.Container = container
+		for _, ctr := range containers {
+			if !ctr.OneOff && ctr.ServiceName == service.Name {
+				service.Container = ctr
 				continue L
 			}
 		}
@@ -276,77 +217,24 @@ L:
 	}
 }
 
-// filterOutExited filters out the exited containers if c.ShowExited is false
-func (c *DockerCommand) filterOutExited(containers []*Container) []*Container {
-	if c.ShowExited {
-		return containers
-	}
-	toReturn := []*Container{}
-	for _, container := range containers {
-		if container.Container.State != "exited" {
-			toReturn = append(toReturn, container)
-		}
-	}
-	return toReturn
-}
-
-// sortedContainers returns containers sorted by state if c.SortContainersByState is true (follows 1- running, 2- exited, 3- created)
-// and sorted by name if c.SortContainersByState is false
-func (c *DockerCommand) sortedContainers(containers []*Container) []*Container {
-	if !c.Config.UserConfig.Gui.LegacySortContainers {
-		states := map[string]int{
-			"running": 1,
-			"exited":  2,
-			"created": 3,
-		}
-		sort.Slice(containers, func(i, j int) bool {
-			stateLeft := states[containers[i].Container.State]
-			stateRight := states[containers[j].Container.State]
-			if stateLeft == stateRight {
-				return containers[i].Name < containers[j].Name
-			}
-			return states[containers[i].Container.State] < states[containers[j].Container.State]
-		})
-	}
-	return containers
-}
-
-// obtainStandaloneContainers returns standalone containers. Standalone containers are containers which are either one-off containers, or whose service is not part of this docker-compose context
-func (c *DockerCommand) obtainStandaloneContainers(containers []*Container, services []*Service) []*Container {
-	standaloneContainers := []*Container{}
-L:
-	for _, container := range containers {
-		for _, service := range services {
-			if !container.OneOff && container.ServiceName != "" && container.ServiceName == service.Name {
-				continue L
-			}
-		}
-		standaloneContainers = append(standaloneContainers, container)
-	}
-
-	return standaloneContainers
-}
-
 // GetContainers gets the docker containers
-func (c *DockerCommand) GetContainers() ([]*Container, error) {
+func (c *DockerCommand) GetContainers(existingContainers []*Container) ([]*Container, error) {
 	c.ContainerMutex.Lock()
 	defer c.ContainerMutex.Unlock()
 
-	existingContainers := c.Containers
-
-	containers, err := c.Client.ContainerList(context.Background(), types.ContainerListOptions{All: true})
+	containers, err := c.Client.ContainerList(context.Background(), container.ListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
 
 	ownContainers := make([]*Container, len(containers))
 
-	for i, container := range containers {
+	for i, ctr := range containers {
 		var newContainer *Container
 
-		// check if we already data stored against the container
+		// check if we already have data stored against the container
 		for _, existingContainer := range existingContainers {
-			if existingContainer.ID == container.ID {
+			if existingContainer.ID == ctr.ID {
 				newContainer = existingContainer
 				break
 			}
@@ -355,30 +243,31 @@ func (c *DockerCommand) GetContainers() ([]*Container, error) {
 		// initialise the container if it's completely new
 		if newContainer == nil {
 			newContainer = &Container{
-				ID:            container.ID,
+				ID:            ctr.ID,
 				Client:        c.Client,
 				OSCommand:     c.OSCommand,
 				Log:           c.Log,
-				Config:        c.Config,
 				DockerCommand: c,
 				Tr:            c.Tr,
 			}
 		}
 
-		newContainer.Container = container
+		newContainer.Container = ctr
 		// if the container is made with a name label we will use that
-		if name, ok := container.Labels["name"]; ok {
+		if name, ok := ctr.Labels["name"]; ok {
 			newContainer.Name = name
 		} else {
-			newContainer.Name = strings.TrimLeft(container.Names[0], "/")
+			newContainer.Name = strings.TrimLeft(ctr.Names[0], "/")
 		}
-		newContainer.ServiceName = container.Labels["com.docker.compose.service"]
-		newContainer.ProjectName = container.Labels["com.docker.compose.project"]
-		newContainer.ContainerNumber = container.Labels["com.docker.compose.container"]
-		newContainer.OneOff = container.Labels["com.docker.compose.oneoff"] == "True"
+		newContainer.ServiceName = ctr.Labels["com.docker.compose.service"]
+		newContainer.ProjectName = ctr.Labels["com.docker.compose.project"]
+		newContainer.ContainerNumber = ctr.Labels["com.docker.compose.container"]
+		newContainer.OneOff = ctr.Labels["com.docker.compose.oneoff"] == "True"
 
 		ownContainers[i] = newContainer
 	}
+
+	c.SetContainerDetails(ownContainers)
 
 	return ownContainers, nil
 }
@@ -390,22 +279,21 @@ func (c *DockerCommand) GetServices() ([]*Service, error) {
 	}
 
 	composeCommand := c.Config.UserConfig.CommandTemplates.DockerCompose
-	output, err := c.OSCommand.RunCommandWithOutput(fmt.Sprintf("%s config --hash=*", composeCommand))
+	output, err := c.OSCommand.RunCommandWithOutput(fmt.Sprintf("%s config --services", composeCommand))
 	if err != nil {
 		return nil, err
 	}
 
 	// output looks like:
-	// service1 998d6d286b0499e0ff23d66302e720991a2asdkf9c30d0542034f610daf8a971
-	// service2 asdld98asdklasd9bccd02438de0994f8e19cbe691feb3755336ec5ca2c55971
+	// service1
+	// service2
 
 	lines := utils.SplitLines(output)
 	services := make([]*Service, len(lines))
 	for i, str := range lines {
-		arr := strings.Split(str, " ")
 		services[i] = &Service{
-			Name:          arr[0],
-			ID:            arr[1],
+			Name:          str,
+			ID:            str,
 			OSCommand:     c.OSCommand,
 			Log:           c.Log,
 			DockerCommand: c,
@@ -415,35 +303,33 @@ func (c *DockerCommand) GetServices() ([]*Service, error) {
 	return services, nil
 }
 
-// UpdateContainerDetails attaches the details returned from docker inspect to each of the containers
-// this contains a bit more info than what you get from the go-docker client
-func (c *DockerCommand) UpdateContainerDetails() error {
+func (c *DockerCommand) RefreshContainerDetails(containers []*Container) error {
 	c.ContainerMutex.Lock()
 	defer c.ContainerMutex.Unlock()
 
-	containers := c.Containers
-
-	ids := make([]string, len(containers))
-	for i, container := range containers {
-		ids[i] = container.ID
-	}
-
-	cmd := c.OSCommand.RunCustomCommand("docker inspect " + strings.Join(ids, " "))
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return err
-	}
-
-	var details []*Details
-	if err := json.Unmarshal(output, &details); err != nil {
-		return err
-	}
-
-	for i, container := range containers {
-		container.Details = *details[i]
-	}
+	c.SetContainerDetails(containers)
 
 	return nil
+}
+
+// Attaches the details returned from docker inspect to each of the containers
+// this contains a bit more info than what you get from the go-docker client
+func (c *DockerCommand) SetContainerDetails(containers []*Container) {
+	wg := sync.WaitGroup{}
+	for _, ctr := range containers {
+		ctr := ctr
+		wg.Add(1)
+		go func() {
+			details, err := c.Client.ContainerInspect(context.Background(), ctr.ID)
+			if err != nil {
+				c.Log.Error(err)
+			} else {
+				ctr.Details = details
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 }
 
 // ViewAllLogs attaches to a subprocess viewing all the logs from docker-compose
@@ -468,9 +354,69 @@ func (c *DockerCommand) DockerComposeConfig() string {
 			c.NewCommandObject(CommandObject{}),
 		),
 	)
-
 	if err != nil {
 		output = err.Error()
 	}
 	return output
+}
+
+// determineDockerHost tries to the determine the docker host that we should connect to
+// in the following order of decreasing precedence:
+//   - value of "DOCKER_HOST" environment variable
+//   - host retrieved from the current context (specified via DOCKER_CONTEXT)
+//   - "default docker host" for the host operating system, otherwise
+func determineDockerHost() (string, error) {
+	// If the docker host is explicitly set via the "DOCKER_HOST" environment variable,
+	// then its a no-brainer :shrug:
+	if os.Getenv("DOCKER_HOST") != "" {
+		return os.Getenv("DOCKER_HOST"), nil
+	}
+
+	currentContext := os.Getenv("DOCKER_CONTEXT")
+	if currentContext == "" {
+		cf, err := cliconfig.Load(cliconfig.Dir())
+		if err != nil {
+			return "", err
+		}
+		currentContext = cf.CurrentContext
+	}
+
+	// On some systems (windows) `default` is stored in the docker config as the currentContext.
+	if currentContext == "" || currentContext == "default" {
+		// If a docker context is neither specified via the "DOCKER_CONTEXT" environment variable nor via the
+		// $HOME/.docker/config file, then we fall back to connecting to the "default docker host" meant for
+		// the host operating system.
+		return defaultDockerHost, nil
+	}
+
+	storeConfig := ctxstore.NewConfig(
+		func() interface{} { return &ddocker.EndpointMeta{} },
+		ctxstore.EndpointTypeGetter(ddocker.DockerEndpoint, func() interface{} { return &ddocker.EndpointMeta{} }),
+	)
+
+	st := ctxstore.New(cliconfig.ContextStoreDir(), storeConfig)
+	md, err := st.GetMetadata(currentContext)
+	if err != nil {
+		return "", err
+	}
+	dockerEP, ok := md.Endpoints[ddocker.DockerEndpoint]
+	if !ok {
+		return "", err
+	}
+	dockerEPMeta, ok := dockerEP.(ddocker.EndpointMeta)
+	if !ok {
+		return "", fmt.Errorf("expected docker.EndpointMeta, got %T", dockerEP)
+	}
+
+	if dockerEPMeta.Host != "" {
+		return dockerEPMeta.Host, nil
+	}
+
+	// We might end up here, if the context was created with the `host` set to an empty value (i.e. '').
+	// For example:
+	// ```sh
+	// docker context create foo --docker "host="
+	// ```
+	// In such scenario, we mimic the `docker` cli and try to connect to the "default docker host".
+	return defaultDockerHost, nil
 }

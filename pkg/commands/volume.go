@@ -2,10 +2,9 @@ package commands
 
 import (
 	"context"
-	"sort"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/sirupsen/logrus"
 )
@@ -13,37 +12,28 @@ import (
 // Volume : A docker Volume
 type Volume struct {
 	Name          string
-	Volume        *types.Volume
+	Volume        *volume.Volume
 	Client        *client.Client
 	OSCommand     *OSCommand
 	Log           *logrus.Entry
 	DockerCommand LimitedDockerCommand
 }
 
-// GetDisplayStrings returns the dispaly string of Container
-func (v *Volume) GetDisplayStrings(isFocused bool) []string {
-	return []string{v.Volume.Driver, v.Name}
-}
-
 // RefreshVolumes gets the volumes and stores them
-func (c *DockerCommand) RefreshVolumes() error {
-	result, err := c.Client.VolumeList(context.Background(), filters.Args{})
+func (c *DockerCommand) RefreshVolumes() ([]*Volume, error) {
+	result, err := c.Client.VolumeList(context.Background(), volume.ListOptions{})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	volumes := result.Volumes
 
 	ownVolumes := make([]*Volume, len(volumes))
 
-	sort.Slice(volumes, func(i, j int) bool {
-		return volumes[i].Name < volumes[j].Name
-	})
-
-	for i, volume := range volumes {
+	for i, vol := range volumes {
 		ownVolumes[i] = &Volume{
-			Name:          volume.Name,
-			Volume:        volume,
+			Name:          vol.Name,
+			Volume:        vol,
 			Client:        c.Client,
 			OSCommand:     c.OSCommand,
 			Log:           c.Log,
@@ -51,9 +41,7 @@ func (c *DockerCommand) RefreshVolumes() error {
 		}
 	}
 
-	c.Volumes = ownVolumes
-
-	return nil
+	return ownVolumes, nil
 }
 
 // PruneVolumes prunes volumes
